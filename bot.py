@@ -4,8 +4,14 @@
 Логика:
 - Тренировки идут по циклу День 1 -> День 2 -> День 3 -> День 1 -> ...
   Бот сам предлагает следующий день, но его можно сменить кнопкой.
-- Для каждого упражнения бот последовательно спрашивает вес и количество
-  повторений для подхода 1, 2, 3 (ввод через кнопки-цифры, без свободного текста).
+- После выбора дня показывается МЕНЮ упражнений этого дня — можно выбрать
+  любое в любом порядке, пропустить, вернуться назад к списку в любой момент
+  (кнопка "↩️ К списку упражнений") или пропустить текущий подход
+  ("⏭ Пропустить подход"). Готовые упражнения отмечаются ✅.
+- Внутри упражнения вес и повторения вводятся через кнопки-цифры (без
+  свободного текста) для подхода 1, 2, 3.
+- /reset — удаляет все сохранённые тренировки текущего пользователя (для
+  очистки тестовых данных).
 - Все данные сохраняются в SQLite (файл, путь берётся из переменной окружения DB_PATH).
 - Отдельный HTTP-эндпоинт /export отдаёт все записи в JSON по секретному токену —
   через него внешний скрипт (запускаемый Клодом в чате) синхронизирует данные
@@ -128,6 +134,26 @@ def all_rows():
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def delete_all(chat_id=None):
+    """Удаляет все записи (или только для конкретного chat_id)."""
+    with closing(db()) as conn:
+        if chat_id is None:
+            conn.execute("DELETE FROM sets")
+        else:
+            conn.execute("DELETE FROM sets WHERE chat_id=?", (chat_id,))
+        conn.commit()
+
+
+def sets_done_for(chat_id, session_date, day_number, exercise):
+    with closing(db()) as conn:
+        row = conn.execute(
+            """SELECT COUNT(*) FROM sets
+               WHERE chat_id=? AND session_date=? AND day_number=? AND exercise=?""",
+            (chat_id, session_date, day_number, exercise),
+        ).fetchone()
+        return row[0] if row else 0
+
+
 # --------------------------------------------------------------------------
 # Состояние диалога (в памяти, per chat_id)
 # --------------------------------------------------------------------------
@@ -145,8 +171,11 @@ def kb_digits(prefix: str, allow_dot: bool) -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(d, callback_data=f"{prefix}:{d}") for d in r] for r in rows]
     buttons.append([InlineKeyboardButton(d, callback_data=f"{prefix}:{d}") for d in last_row])
     buttons.append([
-        InlineKeyboardButton("✖ Отмена", callback_data=f"{prefix}:cancel"),
+        InlineKeyboardButton("⏭ Пропустить подход", callback_data="nav:skipset"),
         InlineKeyboardButton("✅ Готово", callback_data=f"{prefix}:done"),
+    ])
+    buttons.append([
+        InlineKeyboardButton("↩️ К списку упражнений", callback_data="nav:menu"),
     ])
     return InlineKeyboardMarkup(buttons)
 
@@ -167,6 +196,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def menu_kb(chat_id) -> InlineKeyboardMarkup:
+    st = SESSIONS[chat_id]
+    exercises = PROGRAM[st["day"]]
+    rows = []
+    for i, (group, exercise) in enumerate(exercises):
+        done = sets_done_for(chat_id, st["session_date"], st["day"], exercise)
+        mark = "✅ " if done >= SETS_PER_EXERCISE else (f"({done}/{SETS_PER_EXERCISE}) " if done else "")
+        rows.append([InlineKeyboardButton(f"{mark}{exercise}", callback_data=f"menu:{i}")])
+    rows.append([InlineKeyboardButton("🏁 Завершить тренировку", callback_data="nav:finish")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_menu(query, chat_id, note: str = ""):
+    st = SESSIONS[chat_id]
+    text = (
+        f"День {st['day']} · {st['session_date']}\n"
+        f"{note}Выбери упражнение:"
+    )
+    await query.edit_message_text(text, reply_markup=menu_kb(chat_id))
+
+
 async def on_start_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -175,13 +225,13 @@ async def on_start_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SESSIONS[chat_id] = {
         "day": day,
         "session_date": datetime.now(MSK).strftime("%Y-%m-%d"),
-        "ex_idx": 0,
+        "ex_idx": None,
         "set_no": 1,
-        "stage": "weight",
+        "stage": "menu",
         "buffer": "",
         "weight": None,
     }
-    await ask_current(query, chat_id)
+    await show_menu(query, chat_id)
 
 
 def current_exercise(chat_id):
@@ -203,6 +253,63 @@ async def ask_current(query, chat_id):
     await query.edit_message_text(text, reply_markup=kb)
 
 
+async def on_menu_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    if chat_id not in SESSIONS:
+        await query.answer("Сессия не найдена, нажми /start")
+        return
+    await query.answer()
+    st = SESSIONS[chat_id]
+    idx = int(query.data.split(":")[1])
+    st["ex_idx"] = idx
+    group, exercise = current_exercise(chat_id)
+    done = sets_done_for(chat_id, st["session_date"], st["day"], exercise)
+    if done >= SETS_PER_EXERCISE:
+        await show_menu(query, chat_id, note=f"«{exercise}» уже отмечено на {SETS_PER_EXERCISE}/{SETS_PER_EXERCISE} подходов. ")
+        return
+    st["set_no"] = done + 1
+    st["stage"] = "weight"
+    st["buffer"] = ""
+    st["weight"] = None
+    await ask_current(query, chat_id)
+
+
+async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    if chat_id not in SESSIONS:
+        await query.answer("Сессия не найдена, нажми /start")
+        return
+    await query.answer()
+    st = SESSIONS[chat_id]
+    action = query.data.split(":")[1]
+
+    if action == "menu":
+        st["stage"] = "menu"
+        await show_menu(query, chat_id)
+        return
+
+    if action == "finish":
+        del SESSIONS[chat_id]
+        await query.edit_message_text(
+            "Тренировка записана. Отличная работа! 💪\nНажми /start для следующей."
+        )
+        return
+
+    if action == "skipset":
+        # Пропустить текущий подход без сохранения, перейти к следующему.
+        st["buffer"] = ""
+        st["weight"] = None
+        st["stage"] = "weight"
+        if st["set_no"] < SETS_PER_EXERCISE:
+            st["set_no"] += 1
+            await ask_current(query, chat_id)
+        else:
+            await show_menu(query, chat_id)
+        return
+
+
 async def on_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     chat_id = query.message.chat_id
@@ -211,12 +318,6 @@ async def on_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     st = SESSIONS[chat_id]
     _, val = query.data.split(":")
-
-    if val == "cancel":
-        await query.answer()
-        del SESSIONS[chat_id]
-        await query.edit_message_text("Тренировка отменена. Нажми /start, чтобы начать заново.")
-        return
 
     if val == "done":
         if not st["buffer"]:
@@ -242,15 +343,7 @@ async def on_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 st["set_no"] += 1
                 await ask_current(query, chat_id)
             else:
-                st["set_no"] = 1
-                if st["ex_idx"] < len(PROGRAM[st["day"]]) - 1:
-                    st["ex_idx"] += 1
-                    await ask_current(query, chat_id)
-                else:
-                    del SESSIONS[chat_id]
-                    await query.edit_message_text(
-                        "Тренировка записана. Отличная работа! 💪\nНажми /start для следующей."
-                    )
+                await show_menu(query, chat_id, note=f"«{exercise}» готово ✅. ")
         return
 
     await query.answer()
@@ -266,6 +359,13 @@ async def on_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     SESSIONS.pop(update.effective_chat.id, None)
     await update.message.reply_text("Ок, отменил текущий ввод. /start — начать заново.")
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    delete_all(chat_id)
+    SESSIONS.pop(chat_id, None)
+    await update.message.reply_text("Все твои записи тренировок удалены. /start — начать заново.")
 
 
 # --------------------------------------------------------------------------
@@ -294,7 +394,10 @@ def main():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
+    application.add_handler(CommandHandler("reset", cmd_reset))
     application.add_handler(CallbackQueryHandler(on_start_day, pattern=r"^startday:"))
+    application.add_handler(CallbackQueryHandler(on_menu_pick, pattern=r"^menu:"))
+    application.add_handler(CallbackQueryHandler(on_nav, pattern=r"^nav:"))
     application.add_handler(CallbackQueryHandler(on_digit, pattern=r"^val:"))
 
     http_thread = threading.Thread(target=run_http, daemon=True)
