@@ -154,6 +154,31 @@ def sets_done_for(chat_id, session_date, day_number, exercise):
         return row[0] if row else 0
 
 
+def format_number(x) -> str:
+    # 40.0 -> "40", 42.5 -> "42.5"
+    return f"{x:.10f}".rstrip("0").rstrip(".") if x is not None else "-"
+
+
+def session_summary_text(chat_id, session_date, day_number) -> str:
+    """Текстовая сводка всех записанных подходов тренировки — чтобы у пользователя
+    была копия данных прямо в переписке с ботом, на случай проблем с сервером."""
+    lines = []
+    with closing(db()) as conn:
+        for group, exercise in PROGRAM[day_number]:
+            rows = conn.execute(
+                """SELECT set_number, weight, reps FROM sets
+                   WHERE chat_id=? AND session_date=? AND day_number=? AND exercise=?
+                   ORDER BY set_number""",
+                (chat_id, session_date, day_number, exercise),
+            ).fetchall()
+            if rows:
+                sets_str = ", ".join(f"{format_number(w)}кг × {r}" for _, w, r in rows)
+                lines.append(f"• {exercise} ({group}): {sets_str}")
+    if not lines:
+        return "(на этой тренировке ничего не записано)"
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------
 # Состояние диалога (в памяти, per chat_id)
 # --------------------------------------------------------------------------
@@ -291,9 +316,13 @@ async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "finish":
+        day, session_date = st["day"], st["session_date"]
+        summary = session_summary_text(chat_id, session_date, day)
         del SESSIONS[chat_id]
         await query.edit_message_text(
-            "Тренировка записана. Отличная работа! 💪\nНажми /start для следующей."
+            f"Тренировка записана. Отличная работа! 💪\n\n"
+            f"📋 День {day} · {session_date}\n{summary}\n\n"
+            f"Нажми /start для следующей."
         )
         return
 
