@@ -31,7 +31,7 @@ import threading
 from datetime import datetime, timezone, timedelta
 from contextlib import closing
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 import uvicorn
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -403,15 +403,26 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 app = FastAPI()
 
 
+NO_CACHE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+}
+
+
 @app.get("/export")
-def export(token: str = Query(...)):
+def export(response: Response, token: str = Query(...)):
     if token != EXPORT_TOKEN:
         raise HTTPException(status_code=403, detail="bad token")
+    for k, v in NO_CACHE_HEADERS.items():
+        response.headers[k] = v
     return {"rows": all_rows()}
 
 
 @app.get("/health")
-def health():
+def health(response: Response):
+    for k, v in NO_CACHE_HEADERS.items():
+        response.headers[k] = v
     return {"ok": True}
 
 
