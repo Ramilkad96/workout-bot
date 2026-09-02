@@ -12,6 +12,9 @@
   свободного текста) для подхода 1, 2, 3.
 - /reset — удаляет все сохранённые тренировки текущего пользователя (для
   очистки тестовых данных).
+- /edit — редактирование ПОСЛЕДНЕЙ тренировки: выбрать упражнение, затем
+  конкретный подход, и заново ввести вес/повторения (перезаписывает значение,
+  а не добавляет новую запись).
 - Все данные сохраняются в SQLite (файл, путь берётся из переменной окружения DB_PATH).
 - Отдельный HTTP-эндпоинт /export отдаёт все записи в JSON по секретному токену —
   через него внешний скрипт (запускаемый Клодом в чате) синхронизирует данные
@@ -154,6 +157,54 @@ def sets_done_for(chat_id, session_date, day_number, exercise):
         return row[0] if row else 0
 
 
+def last_session(chat_id):
+    """(day_number, session_date) последней тренировки или None."""
+    with closing(db()) as conn:
+        row = conn.execute(
+            "SELECT day_number, session_date FROM sets WHERE chat_id=? ORDER BY id DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
+
+def get_sets(chat_id, session_date, day_number, exercise):
+    """{set_number: (weight, reps)} для конкретного упражнения этой тренировки."""
+    with closing(db()) as conn:
+        rows = conn.execute(
+            """SELECT set_number, weight, reps FROM sets
+               WHERE chat_id=? AND session_date=? AND day_number=? AND exercise=?
+               ORDER BY set_number""",
+            (chat_id, session_date, day_number, exercise),
+        ).fetchall()
+        return {r[0]: (r[1], r[2]) for r in rows}
+
+
+def update_set(chat_id, session_date, day_number, exercise, set_number, weight, reps):
+    """Правит существующий подход (или создаёт, если его почему-то не было)."""
+    with closing(db()) as conn:
+        row = conn.execute(
+            """SELECT id FROM sets
+               WHERE chat_id=? AND session_date=? AND day_number=? AND exercise=? AND set_number=?
+               ORDER BY id DESC LIMIT 1""",
+            (chat_id, session_date, day_number, exercise, set_number),
+        ).fetchone()
+        if row:
+            conn.execute("UPDATE sets SET weight=?, reps=? WHERE id=?", (weight, reps, row[0]))
+        else:
+            conn.execute(
+                """INSERT INTO sets
+                   (chat_id, session_date, day_number, muscle_group, exercise, set_number,
+                    weight, reps, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (
+                    chat_id, session_date, day_number,
+                    next(g for g, e in PROGRAM[day_number] if e == exercise),
+                    exercise, set_number, weight, reps, datetime.now(MSK).isoformat(),
+                ),
+            )
+        conn.commit()
+
+
 def format_number(x) -> str:
     # 40.0 -> "40", 42.5 -> "42.5"
     return f"{x:.10f}".rstrip("0").rstrip(".") if x is not None else "-"
@@ -190,18 +241,22 @@ def session_summary_text(chat_id, session_date, day_number) -> str:
 SESSIONS: dict[int, dict] = {}
 
 
-def kb_digits(prefix: str, allow_dot: bool) -> InlineKeyboardMarkup:
+def kb_digits(prefix: str, allow_dot: bool, mode: str = "train") -> InlineKeyboardMarkup:
     rows = [["1", "2", "3"], ["4", "5", "6"], ["7", "8", "9"]]
     last_row = ["0", ".", "⌫"] if allow_dot else ["0", "⌫", "⌫"]
     buttons = [[InlineKeyboardButton(d, callback_data=f"{prefix}:{d}") for d in r] for r in rows]
     buttons.append([InlineKeyboardButton(d, callback_data=f"{prefix}:{d}") for d in last_row])
-    buttons.append([
-        InlineKeyboardButton("⏭ Пропустить подход", callback_data="nav:skipset"),
-        InlineKeyboardButton("✅ Готово", callback_data=f"{prefix}:done"),
-    ])
-    buttons.append([
-        InlineKeyboardButton("↩️ К списку упражнений", callback_data="nav:menu"),
-    ])
+    if mode == "edit":
+        buttons.append([InlineKeyboardButton("✅ Сохранить", callback_data=f"{prefix}:done")])
+        buttons.append([InlineKeyboardButton("↩️ Отмена", callback_data="nav:eback")])
+    else:
+        buttons.append([
+            InlineKeyboardButton("⏭ Пропустить подход", callback_data="nav:skipset"),
+            InlineKeyboardButton("✅ Готово", callback_data=f"{prefix}:done"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("↩️ К списку упражнений", callback_data="nav:menu"),
+        ])
     return InlineKeyboardMarkup(buttons)
 
 
@@ -248,6 +303,7 @@ async def on_start_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat_id
     day = int(query.data.split(":")[1])
     SESSIONS[chat_id] = {
+        "mode": "train",
         "day": day,
         "session_date": datetime.now(MSK).strftime("%Y-%m-%d"),
         "ex_idx": None,
@@ -274,7 +330,7 @@ async def ask_current(query, chat_id):
         f"Подход {st['set_no']} из {SETS_PER_EXERCISE}\n"
         f"Введи {stage_label}: {st['buffer'] or '—'}"
     )
-    kb = kb_digits("val", allow_dot=(st["stage"] == "weight"))
+    kb = kb_digits("val", allow_dot=(st["stage"] == "weight"), mode=st.get("mode", "train"))
     await query.edit_message_text(text, reply_markup=kb)
 
 
@@ -294,6 +350,109 @@ async def on_menu_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_menu(query, chat_id, note=f"«{exercise}» уже отмечено на {SETS_PER_EXERCISE}/{SETS_PER_EXERCISE} подходов. ")
         return
     st["set_no"] = done + 1
+    st["stage"] = "weight"
+    st["buffer"] = ""
+    st["weight"] = None
+    await ask_current(query, chat_id)
+
+
+# --------------------------------------------------------------------------
+# Редактирование последней тренировки (/edit)
+# --------------------------------------------------------------------------
+
+def edit_menu_kb(chat_id) -> InlineKeyboardMarkup:
+    st = SESSIONS[chat_id]
+    exercises = PROGRAM[st["day"]]
+    rows = []
+    for i, (group, exercise) in enumerate(exercises):
+        done = sets_done_for(chat_id, st["session_date"], st["day"], exercise)
+        label = f"{exercise} ({done}/{SETS_PER_EXERCISE} подх.)" if done else f"{exercise} (нет данных)"
+        rows.append([InlineKeyboardButton(label, callback_data=f"emenu:{i}")])
+    rows.append([InlineKeyboardButton("✅ Готово", callback_data="nav:editdone")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_edit_menu(query, chat_id, note: str = ""):
+    st = SESSIONS[chat_id]
+    text = (
+        f"✏️ Редактирование — День {st['day']} · {st['session_date']}\n"
+        f"{note}Какое упражнение исправить?"
+    )
+    await query.edit_message_text(text, reply_markup=edit_menu_kb(chat_id))
+
+
+def edit_set_kb(chat_id) -> InlineKeyboardMarkup:
+    st = SESSIONS[chat_id]
+    group, exercise = current_exercise(chat_id)
+    sets = get_sets(chat_id, st["session_date"], st["day"], exercise)
+    rows = []
+    for s in range(1, SETS_PER_EXERCISE + 1):
+        if s in sets:
+            w, r = sets[s]
+            label = f"Подход {s}: {format_number(w)}кг × {r}"
+        else:
+            label = f"Подход {s}: — (не заполнен)"
+        rows.append([InlineKeyboardButton(label, callback_data=f"eset:{s}")])
+    rows.append([InlineKeyboardButton("↩️ К упражнениям", callback_data="nav:eback")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_edit_set_menu(query, chat_id, note: str = ""):
+    st = SESSIONS[chat_id]
+    group, exercise = current_exercise(chat_id)
+    text = (
+        f"✏️ {exercise} ({group})\n"
+        f"{note}Какой подход исправить?"
+    )
+    await query.edit_message_text(text, reply_markup=edit_set_kb(chat_id))
+
+
+async def cmd_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    last = last_session(chat_id)
+    if not last:
+        await update.message.reply_text("Пока нет ни одной сохранённой тренировки.")
+        return
+    day_number, session_date = last
+    SESSIONS[chat_id] = {
+        "mode": "edit",
+        "day": day_number,
+        "session_date": session_date,
+        "ex_idx": None,
+        "set_no": None,
+        "stage": "edit_ex_menu",
+        "buffer": "",
+        "weight": None,
+    }
+    await update.message.reply_text(
+        f"✏️ Редактирование последней тренировки — День {day_number} · {session_date}\n"
+        f"Какое упражнение исправить?",
+        reply_markup=edit_menu_kb(chat_id),
+    )
+
+
+async def on_edit_menu_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    if chat_id not in SESSIONS:
+        await query.answer("Сессия не найдена, нажми /edit")
+        return
+    await query.answer()
+    st = SESSIONS[chat_id]
+    st["ex_idx"] = int(query.data.split(":")[1])
+    st["stage"] = "edit_set_menu"
+    await show_edit_set_menu(query, chat_id)
+
+
+async def on_edit_set_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    if chat_id not in SESSIONS:
+        await query.answer("Сессия не найдена, нажми /edit")
+        return
+    await query.answer()
+    st = SESSIONS[chat_id]
+    st["set_no"] = int(query.data.split(":")[1])
     st["stage"] = "weight"
     st["buffer"] = ""
     st["weight"] = None
@@ -338,6 +497,16 @@ async def on_nav(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_menu(query, chat_id)
         return
 
+    if action == "eback":
+        st["stage"] = "edit_set_menu"
+        await show_edit_set_menu(query, chat_id)
+        return
+
+    if action == "editdone":
+        del SESSIONS[chat_id]
+        await query.edit_message_text("Готово, изменения сохранены. Не забудь потом попросить обновить таблицу.")
+        return
+
 
 async def on_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -361,18 +530,28 @@ async def on_digit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             reps = int(st["buffer"])
             group, exercise = current_exercise(chat_id)
-            save_set(
-                chat_id, st["session_date"], st["day"], group, exercise,
-                st["set_no"], st["weight"], reps,
-            )
-            st["buffer"] = ""
-            st["stage"] = "weight"
-            st["weight"] = None
-            if st["set_no"] < SETS_PER_EXERCISE:
-                st["set_no"] += 1
-                await ask_current(query, chat_id)
+            if st.get("mode") == "edit":
+                update_set(
+                    chat_id, st["session_date"], st["day"], exercise,
+                    st["set_no"], st["weight"], reps,
+                )
+                st["buffer"] = ""
+                st["stage"] = "edit_set_menu"
+                st["weight"] = None
+                await show_edit_set_menu(query, chat_id, note=f"Подход {st['set_no']} обновлён ✅. ")
             else:
-                await show_menu(query, chat_id, note=f"«{exercise}» готово ✅. ")
+                save_set(
+                    chat_id, st["session_date"], st["day"], group, exercise,
+                    st["set_no"], st["weight"], reps,
+                )
+                st["buffer"] = ""
+                st["stage"] = "weight"
+                st["weight"] = None
+                if st["set_no"] < SETS_PER_EXERCISE:
+                    st["set_no"] += 1
+                    await ask_current(query, chat_id)
+                else:
+                    await show_menu(query, chat_id, note=f"«{exercise}» готово ✅. ")
         return
 
     await query.answer()
@@ -435,8 +614,11 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("cancel", cmd_cancel))
     application.add_handler(CommandHandler("reset", cmd_reset))
+    application.add_handler(CommandHandler("edit", cmd_edit))
     application.add_handler(CallbackQueryHandler(on_start_day, pattern=r"^startday:"))
     application.add_handler(CallbackQueryHandler(on_menu_pick, pattern=r"^menu:"))
+    application.add_handler(CallbackQueryHandler(on_edit_menu_pick, pattern=r"^emenu:"))
+    application.add_handler(CallbackQueryHandler(on_edit_set_pick, pattern=r"^eset:"))
     application.add_handler(CallbackQueryHandler(on_nav, pattern=r"^nav:"))
     application.add_handler(CallbackQueryHandler(on_digit, pattern=r"^val:"))
 
